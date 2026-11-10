@@ -1,0 +1,24 @@
+# net-monitor configuration
+# Copy to /etc/net/net.conf (install.sh does this) and edit.
+
+# Seconds between full ping sweeps.
+INTERVAL=10
+
+# ping -c count (number of echo requests per probe).
+PING_COUNT=1
+
+# ping -W timeout, seconds. Must be < INTERVAL / number_of_targets to avoid overlap.
+PING_TIMEOUT=2
+
+# Where logs are written. One subdir per day: $LOG_DIR/YYYY-MM-DD/ping-<host>.csv
+LOG_DIR=/var/log/net
+
+# How many days of logs to keep. 0 = keep forever.
+LOG_RETENTION_DAYS=30
+
+# Name reported as "source" in the logs. Default: this host's `hostname -s`.
+# SOURCE_NAME=web-01
+
+# Also ping ourselves. Useful to catch local stack issues (loopback RTT spikes,
+# kernel stalls). Set to 0 to disable.
+PING_SELF=1
