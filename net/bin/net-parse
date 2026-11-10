@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# net-parse — query the CSV logs produced by net-monitor.
+#
+# Usage:
+#   net-parse [--log-dir DIR] [--date YYYY-MM-DD|today|yesterday]
+#             [--source NAME] [--target NAME]
+#             [--status ok|timeout|unreachable|error]
+#             [--since-epoch N] [--until-epoch N]
+#             <command>
+#
+# Commands:
+#   tail           Print matching rows (CSV, with header).
+#   summary        Per-target counts: ok / timeout / unreachable / error,
+#                  plus avg/min/max RTT (ms) and loss% avg.
+#   losses         Only rows where status != ok.
+#   rtt            Per-target avg RTT in ms (one line per target).
+#
+# Default log dir: /var/log/net
+
+set -eu
+set -o pipefail
+
+NET_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$NET_ROOT/lib/common.sh"
+
+LOG_DIR="/var/log/net"
+DATE_FILTER=""
+SOURCE_FILTER=""
+TARGET_FILTER=""
+STATUS_FILTER=""
+SINCE_EPOCH=""
+UNTIL_EPOCH=""
+CMD=""
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while (( $# > 0 )); do
+    case "$1" in
+        --log-dir)     LOG_DIR="$2"; shift 2 ;;
+        --date)        DATE_FILTER="$2"; shift 2 ;;
+        --source)      SOURCE_FILTER="$2"; shift 2 ;;
+        --target)      TARGET_FILTER="$2"; shift 2 ;;
+        --status)      STATUS_FILTER="$2"; shift 2 ;;
+        --since-epoch) SINCE_EPOCH="$2"; shift 2 ;;
+        --until-epoch) UNTIL_EPOCH="$2"; shift 2 ;;
+        -h|--help)     usage 0 ;;
+        tail|summary|losses|rtt) CMD="$1"; shift ;;
+        *) common_log ERROR "unknown arg: $1"; usage 1 ;;
+    esac
+done
+
+[[ -n "$CMD" ]] || { common_log ERROR "missing command"; usage 1; }
+
+case "$DATE_FILTER" in
+    today)     DATE_FILTER="$(date -u +%Y-%m-%d)" ;;
+    yesterday) DATE_FILTER="$(date -u -d 'yesterday' +%Y-%m-%d)" ;;
+esac
+
+# Collect matching files.
+mapfile -t FILES < <(
+    if [[ -n "$DATE_FILTER" ]]; then
+        find "$LOG_DIR/$DATE_FILTER" -maxdepth 1 -name 'ping-*.csv' 2>/dev/null | sort
+    else
+        find "$LOG_DIR" -mindepth 2 -maxdepth 2 -name 'ping-*.csv' 2>/dev/null | sort
+    fi
+)
+(( ${#FILES[@]} > 0 )) || common_die "no matching logs under $LOG_DIR"
+
+# Stream rows (skip headers, apply filters) to stdout.
+# Columns: 1 ts_iso 2 ts_epoch 3 source 4 target_name 5 target_addr 6 status 7 rtt 8 ttl 9 loss
+stream_rows() {
+    awk -F',' -v src="$SOURCE_FILTER" -v tgt="$TARGET_FILTER" \
+        -v st="$STATUS_FILTER" -v s0="$SINCE_EPOCH" -v s1="$UNTIL_EPOCH" '
+        FNR == 1 { next }  # header
+        src != "" && $3 != src { next }
+        tgt != "" && $4 != tgt { next }
+        st  != "" && $6 != st  { next }
+        s0  != "" && $2 + 0 < s0 + 0 { next }
+        s1  != "" && $2 + 0 > s1 + 0 { next }
+        { print }
+    ' "${FILES[@]}"
+}
+
+case "$CMD" in
+    tail)
+        printf '%s\n' 'ts_iso,ts_epoch,source,target_name,target_addr,status,rtt_ms,ttl,loss_pct'
+        stream_rows
+        ;;
+    losses)
+        printf '%s\n' 'ts_iso,ts_epoch,source,target_name,target_addr,status,rtt_ms,ttl,loss_pct'
+        stream_rows | awk -F',' '$6 != "ok"'
+        ;;
+    summary)
+        stream_rows | awk -F',' '
+            {
+                key = $3 "->" $4
+                n[key]++
+                s[key "/" $6]++
+                if ($7 != "") {
+                    rtt_sum[key] += $7; rtt_n[key]++
+                    if (rtt_min[key] == "" || $7 + 0 < rtt_min[key]) rtt_min[key] = $7 + 0
+                    if ($7 + 0 > rtt_max[key]) rtt_max[key] = $7 + 0
+                }
+                if ($9 != "") { loss_sum[key] += $9; loss_n[key]++ }
+            }
+            END {
+                printf "%-28s %6s %6s %6s %6s %6s %10s %10s %10s %8s\n",
+                    "pair","total","ok","to","unr","err","rtt_avg","rtt_min","rtt_max","loss%_avg"
+                for (k in n) {
+                    avg = (rtt_n[k] ? rtt_sum[k]/rtt_n[k] : 0)
+                    lavg = (loss_n[k] ? loss_sum[k]/loss_n[k] : 0)
+                    printf "%-28s %6d %6d %6d %6d %6d %10.3f %10.3f %10.3f %8.2f\n",
+                        k, n[k], s[k"/ok"]+0, s[k"/timeout"]+0,
+                        s[k"/unreachable"]+0, s[k"/error"]+0,
+                        avg, rtt_min[k]+0, rtt_max[k]+0, lavg
+                }
+            }
+        ' | (read -r h; printf '%s\n' "$h"; sort)
+        ;;
+    rtt)
+        stream_rows | awk -F',' '
+            $7 != "" { sum[$3"->"$4] += $7; n[$3"->"$4]++ }
+            END { for (k in n) printf "%-28s %10.3f ms (n=%d)\n", k, sum[k]/n[k], n[k] }
+        ' | sort
+        ;;
+esac

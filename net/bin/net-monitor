@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# net-monitor — daemon loop. Pings every configured target every INTERVAL
+# seconds and appends one CSV row per probe. Rotates logs daily.
+#
+# Usage:
+#   net-monitor [--config DIR] [--once]
+#
+# Default config dir: /etc/net  (install.sh sets this up).
+# --once runs a single sweep and exits (useful for cron, tests, debugging).
+
+set -eu
+set -o pipefail
+
+NET_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export NET_ROOT
+
+# shellcheck source=../lib/common.sh
+source "$NET_ROOT/lib/common.sh"
+# shellcheck source=../lib/config.sh
+source "$NET_ROOT/lib/config.sh"
+# shellcheck source=../lib/logger.sh
+source "$NET_ROOT/lib/logger.sh"
+# shellcheck source=../lib/pinger.sh
+source "$NET_ROOT/lib/pinger.sh"
+
+usage() {
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+CONFIG_DIR="/etc/net"
+ONCE=0
+
+while (( $# > 0 )); do
+    case "$1" in
+        --config) CONFIG_DIR="$2"; shift 2 ;;
+        --once)   ONCE=1; shift ;;
+        -h|--help) usage 0 ;;
+        *) common_log ERROR "unknown arg: $1"; usage 1 ;;
+    esac
+done
+
+config_load "$CONFIG_DIR/net.conf" "$CONFIG_DIR/servers.conf"
+
+# Graceful shutdown on SIGTERM/SIGINT.
+__stop=0
+trap '__stop=1' TERM INT
+
+common_log INFO "net-monitor starting: source=$CFG_SOURCE_NAME targets=${#CFG_TARGET_NAMES[@]} interval=${CFG_INTERVAL}s log_dir=$CFG_LOG_DIR"
+
+sweep() {
+    local file; file="$(logger_ensure "$CFG_LOG_DIR" "$CFG_SOURCE_NAME")"
+    local i name addr result status rtt ttl loss
+
+    # Self-probe first, if enabled.
+    if [[ "$CFG_PING_SELF" == "1" ]]; then
+        result=$(pinger_probe "127.0.0.1" "$CFG_PING_COUNT" "$CFG_PING_TIMEOUT")
+        read -r status rtt ttl loss <<<"$result"
+        logger_write "$file" "$CFG_SOURCE_NAME" "self" "127.0.0.1" \
+            "$status" "$rtt" "$ttl" "$loss"
+    fi
+
+    for (( i=0; i<${#CFG_TARGET_NAMES[@]}; i++ )); do
+        name="${CFG_TARGET_NAMES[$i]}"
+        addr="${CFG_TARGET_ADDRS[$i]}"
+        result=$(pinger_probe "$addr" "$CFG_PING_COUNT" "$CFG_PING_TIMEOUT")
+        read -r status rtt ttl loss <<<"$result"
+        logger_write "$file" "$CFG_SOURCE_NAME" "$name" "$addr" \
+            "$status" "$rtt" "$ttl" "$loss"
+    done
+}
+
+if (( ONCE )); then
+    sweep
+    exit 0
+fi
+
+# Main loop. We rotate once per iteration; the find is cheap.
+while (( __stop == 0 )); do
+    sweep
+    logger_rotate "$CFG_LOG_DIR" "$CFG_LOG_RETENTION_DAYS"
+    # Sleep in 1s chunks so SIGTERM is responsive.
+    for (( s=0; s<CFG_INTERVAL; s++ )); do
+        (( __stop )) && break
+        sleep 1
+    done
+done
+
+common_log INFO "net-monitor stopped"
