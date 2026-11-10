@@ -1,0 +1,27 @@
+[Unit]
+Description=net-monitor interconnectivity logger
+Documentation=https://github.com/maifeeulasad/system-observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User=root by default so ping has CAP_NET_RAW; iputils-ping on Ubuntu is
+# setuid/setcap and works without root, but running as root also keeps
+# /var/log/net writable without extra setup. Switch to a dedicated user
+# after creating it + chowning LOG_DIR if you prefer.
+ExecStart=/opt/net/bin/net-monitor --config /etc/net
+Restart=on-failure
+RestartSec=5
+# Hardening — safe for a read-mostly ping + append-only log workload.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/net
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
